@@ -13,8 +13,8 @@ from torchvision import utils
 from torchaudio.transforms import GriffinLim, InverseMelScale
 from ops import positional_encoding
 
-from util import to_device, plot_att_heads, text_id_to_string
-from model import Encoder, Decoder
+from util import to_device, plot_att_heads, text_id_to_string, confusion_matrix, plot_heatmap
+from model import SST
 from dataset import Dataset, _symbol_to_id, sample_rate
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -22,29 +22,20 @@ epoch_total = 64
 batch_size = 16
 enc_lr = 0.0001
 dec_lr = 0.0005
-emb_lr = 0.0001
-sym_dim = len(_symbol_to_id)
-
-griffin_lim = GriffinLim(n_fft=1024, hop_length=256).to(device)
-mel_lin = InverseMelScale(n_stft=1024, n_mels=80, sample_rate=sample_rate, f_min=1e-5, f_max=3000.).to(device)
 
 # -----------------------------------
+nr_symbols = len(_symbol_to_id)
+weights = (torch.arange(nr_symbols) >= 10).to(torch.float)
+weights = ((weights + 1) / 2).to(device)
+model = SST(mel_channels=80, text_channels=nr_symbols, emb_channels=256).to(device)
 
-text_embedding = nn.Embedding(num_embeddings=sym_dim, embedding_dim=256).to(device)
-pos_embedding_mel = nn.Embedding.from_pretrained(positional_encoding(512, 256), freeze=True).to(device)
-pos_embedding_text = nn.Embedding.from_pretrained(positional_encoding(256, 256), freeze=True).to(device)
-
-encoder = Encoder(in_channels=80, emb_channels=256).to(device)
-decoder = Decoder(in_channels=256, out_channels=sym_dim, enc_channels=256, emb_channels=256).to(device)
-
-optimizer = torch.optim.Adam([{'params': text_embedding.parameters(), 'lr': emb_lr},
-                              {'params': encoder.parameters(), 'lr': enc_lr},
-                              {'params': decoder.parameters(), 'lr': dec_lr}],
+optimizer = torch.optim.Adam([{'params': model.encoder.parameters(), 'lr': enc_lr},
+                              {'params': model.decoder.parameters(), 'lr': dec_lr}],
                              lr=0.001)
 
 # -----------------------------------
 
-logs_idx = f'emb_lr{emb_lr}-enc_lr{enc_lr}-dec_lr{dec_lr}-batch_size{batch_size}_'
+logs_idx = f'enc_lr{enc_lr}-dec_lr{dec_lr}-batch_size{batch_size}_pos2'
 saves = glob.glob(f'logs/{logs_idx}/*.pt')
 dataset = Dataset('../DATASETS/LJSpeech-1.1/metadata.csv', '../DATASETS/LJSpeech-1.1')
 dataloader = DataLoader(dataset, collate_fn=dataset.collocate, batch_size=batch_size,
@@ -53,12 +44,8 @@ writer = tensorboard.SummaryWriter(log_dir=f'logs/{logs_idx}')
 if len(saves) != 0:
     saves.sort(key=os.path.getmtime)
     checkpoint = torch.load(saves[-1], )
-    text_embedding.load_state_dict(checkpoint['text_embedding'])
-    text_embedding.train()
-    encoder.load_state_dict(checkpoint['encoder'])
-    encoder.train()
-    decoder.load_state_dict(checkpoint['decoder'])
-    decoder.train()
+    model.load_state_dict(checkpoint['model'])
+    model.train()
     optimizer.load_state_dict(checkpoint['optimizer'])
 
     epoch = checkpoint['epoch']
@@ -67,40 +54,35 @@ else:
     epoch = 0
     global_idx = 0
 
-
 # ---------------------------------------
 
 summ_counter = 0
 mean_losses = np.zeros(3)
-mean_metrics = np.zeros(4)
+mean_metrics = np.zeros(5)
 for epoch in tqdm(range(epoch, epoch_total),
                   initial=epoch, total=epoch_total, leave=False, dynamic_ncols=True):
     for idx, batch in enumerate(tqdm(BackgroundGenerator(dataloader),
                                      total=len(dataloader), leave=False, dynamic_ncols=True)):
-        text_data, text_pos, text_len, text_mask, mel_data, mel_pos, mel_len, mel_mask, gate = to_device(batch, device)
+        text_data, text_pos, text_len, text_mask, mel_data, mel_pos, mel_len, mel_mask, gate, text_data_ = to_device(batch, device)
 
-        mel_pos_emb = pos_embedding_mel(mel_pos)
-        enc_out, att_heads_enc = encoder(mel_data, mel_mask, mel_pos_emb)
+        text_out, gate_out, att_heads_enc, att_heads_dec, att_heads = model(mel_data, mel_pos, mel_mask,
+                                                                            text_data_, text_pos, text_mask)
 
-        # [B, T, C], [B, T, C], [B, T, 1], [B, T, T_text]
-        text_emb = text_embedding(text_data)
-        text_pos_emb = pos_embedding_text(text_pos)
-        text_out, gate_out, att_heads_dec, att_heads = decoder(text_emb, enc_out, text_mask, mel_mask, text_pos_emb)
-
-        loss_text = F.cross_entropy(text_out.view(-1, sym_dim), text_data.view(-1), ignore_index=0)
+        loss_text = F.cross_entropy(text_out.view(-1, nr_symbols), text_data.view(-1), weight=weights, ignore_index=0)
         loss_gate = F.binary_cross_entropy(gate_out, gate)
         loss = loss_text + loss_gate
-
         optimizer.zero_grad()
         loss.backward()
+        # print(mel_mask.grad)
 
-        grad_norm_enc = nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
-        grad_norm_dec = nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+        grad_norm_enc = nn.utils.clip_grad_norm_(model.encoder.parameters(), 1.0)
+        grad_norm_dec = nn.utils.clip_grad_norm_(model.decoder.parameters(), 1.0)
 
         optimizer.step()
 
         # -----------------------------------------
 
+        gate_val = torch.gather(gate_out.squeeze(-1), 1, text_len.unsqueeze(-1) - 1).mean()
         global_idx += 1
         summ_counter += 1
         mean_losses += [loss_text.item(),
@@ -108,10 +90,11 @@ for epoch in tqdm(range(epoch, epoch_total),
                         loss.item()]
         mean_metrics += [grad_norm_enc,
                          grad_norm_dec,
-                         encoder.pos_alpha.item(),
-                         decoder.pos_alpha.item()]
+                         model.encoder.pos_alpha.item(),
+                         model.decoder.pos_alpha.item(),
+                         gate_val.item()]
 
-        if global_idx % 10 == 0:
+        if global_idx % 100 == 0:
             # print(attentions_t[:4])
             mean_losses /= summ_counter
             mean_metrics /= summ_counter
@@ -123,42 +106,34 @@ for epoch in tqdm(range(epoch, epoch_total),
             writer.add_scalar('grad_norm/dec', mean_metrics[1], global_idx)
             writer.add_scalar('alpha/enc', mean_metrics[2], global_idx)
             writer.add_scalar('alpha/dec', mean_metrics[3], global_idx)
-            mean_losses = np.zeros(3)
-            mean_metrics = np.zeros(4)
+            writer.add_scalar('gate_val', mean_metrics[4], global_idx)
+            mean_losses = np.zeros_like(mean_losses)
+            mean_metrics = np.zeros_like(mean_metrics)
             summ_counter = 0
 
-            for mel_data_, mel_len_ in zip(mel_data[:4], mel_len[:4]):
-                mel_data_ = mel_data_[:mel_len_].transpose(0, 1)
-                print(mel_data_.size())
-                mel_min_max = np.log([1e-5, 3000.])
-                mel_range = mel_min_max[1] - np.mean(mel_min_max)
-                mel_mean = np.mean(mel_min_max)
-                mel_data_ = (mel_data_ - 10) / 10.
-                mel_data_ = mel_data_ * mel_range + mel_mean
-                mel_data_ = mel_data_.exp()
-                print(mel_data_.size())
-                mel_data_ = mel_lin(mel_data_)
-                mel_data_ = griffin_lim(mel_data_)
-                writer.add_audio(f'audio', mel_data_, global_step=global_idx, sample_rate=sample_rate)
+            writer.add_figure('batch_CM', confusion_matrix(text_out, text_data, [*_symbol_to_id]), global_idx)
 
-            _, text_out = text_out.max(-1)
-            for text_idx, text in enumerate(text_id_to_string(text_data[:4], text_len[:4])):
-                writer.add_text(f'text/input', text, global_idx)
+            writer.add_text(f'text/input', text_id_to_string(text_data[:4], text_len=text_len[:4]), global_idx)
 
-            for text_idx, text in enumerate(text_id_to_string(text_out[:4], text_len[:4])):
-                writer.add_text(f'text/output', text, global_idx)
+            gate_out[:, -1] = 1
+            text_len = (gate_out.squeeze(-1) > .9).to(torch.float)
+            text_len = text_len / (torch.arange(gate_out.size(1), device=device) + 1.)
+            text_len = text_len.argmax(-1) + 1
+
+            text_out = text_out.argmax(-1)
+            writer.add_text(f'text/output', text_id_to_string(text_out[:4], text_len=text_len[:4]), global_idx)
 
             # [B, 1, T, 1], [B, 1, T, C]
-            mel_data = mel_data.unsqueeze(1).transpose(2, 3)
-            mel_data = utils.make_grid(mel_data[:4], nrow=1, padding=2, pad_value=1, normalize=True, scale_each=True)
-            writer.add_image(f'mel', mel_data, global_idx)
+            # mel_data = mel_data.unsqueeze(1).transpose(2, 3)
+            # mel_data = utils.make_grid(mel_data[:4], nrow=1, padding=2, pad_value=1, normalize=True, scale_each=True)
+            # writer.add_image(f'mel', mel_data, global_idx)
 
-            gate = gate.expand(-1, -1, 10).unsqueeze(1).transpose(2, 3)
-            gate_out = gate_out.expand(-1, -1, 10).unsqueeze(1).transpose(2, 3)
-            gate_out = torch.cat([gate, gate_out], 2)
-            gate_out = utils.make_grid(gate_out[:4], nrow=1, padding=2, pad_value=.5,
-                                       normalize=True, range=(0, 1))
-            writer.add_image(f'gate', gate_out, global_idx)
+            gate = gate.expand(-1, -1, 15).transpose(1, 2)
+            gate_out = gate_out.expand(-1, -1, 15).transpose(1, 2)
+            gate_out = torch.cat([gate, gate_out], 1)
+
+            writer.add_figure('enc_mask', plot_heatmap(mel_mask[:4].expand(-1, 30, -1)), global_idx)
+            writer.add_figure('gate_heatmap', plot_heatmap(gate_out[:4]), global_idx)
 
             writer.add_image(f'attention', plot_att_heads(att_heads, 1), global_idx)
             writer.add_image(f'attention_enc', plot_att_heads(att_heads_enc, 1), global_idx)
@@ -166,36 +141,20 @@ for epoch in tqdm(range(epoch, epoch_total),
 
             if global_idx % 1000 == 0:
                 with torch.no_grad():
-                    text_pos = torch.arange(1, 256).view(1, 255).expand(4, -1).to(device)
-                    text_pos_emb = pos_embedding_text(text_pos)
-                    text_mask = torch.triu(torch.ones(256, 256, dtype=torch.bool), 1).unsqueeze(0).to(device)
-                    text_data = torch.zeros(4, 255, dtype=text_data.dtype).to(device)
-                    enc_out = enc_out[:4]
-                    mel_mask = mel_mask[:4]
-                    for pos_idx in tqdm(range(255), leave=False, dynamic_ncols=True):
-                        text_emb = text_embedding(text_data)
-                        (text_out, gate_out,
-                         att_heads_dec, att1_heads) = decoder(text_emb[:, :pos_idx + 1], enc_out,
-                                                              text_mask[:, :pos_idx + 1, :pos_idx + 1],
-                                                              mel_mask, text_pos_emb[:, :pos_idx + 1])
+                    model.eval()
+                    text_out, gate_out, att_heads_enc, att_heads_dec, att_heads = model(mel_data, mel_pos, mel_mask)
+                    model.train()
+                gate_out[:, -1] = 1
+                text_len = (gate_out.squeeze(-1) > .9).to(torch.float)
+                text_len = text_len / (torch.arange(gate_out.size(1), device=device) + 1.)
+                text_len = text_len.argmax(-1) + 1
 
-                        text_out = text_out.argmax(-1)
-                        text_data[:, pos_idx] = text_out[:, pos_idx]
-                    text_len = gate_out.argmax(1).unsqueeze(-1) + 1
-
-                for text_idx, text in enumerate(text_id_to_string(text_out)):
-                    writer.add_text(f'text/pred', text, global_idx)
-
-                for text_idx, text in enumerate(text_id_to_string(text_out, text_len)):
-                    writer.add_text(f'text/pred2', text, global_idx)
-
-                gate = F.pad(gate, (0, 255 - gate.size(-1)))
-                gate_out = gate_out.expand(-1, -1, 10).unsqueeze(1).transpose(2, 3)
-                gate_out = torch.cat([gate[:4], gate_out], 2)
-                gate_out = utils.make_grid(gate_out[:4], nrow=1, padding=2, pad_value=.5,
-                                           normalize=True, range=(0, 1))
-                writer.add_image(f'gate/test', gate_out, global_idx)
-
+                text_out = text_out.argmax(-1)
+                writer.add_text(f'text/pred_clip', text_id_to_string(text_out, text_len=text_len), global_idx)
+                writer.add_text(f'text/pred', text_id_to_string(text_out), global_idx)
+                
+                gate_out = gate_out.expand(-1, -1, 30).transpose(1, 2)
+                writer.add_figure('gate_heatmap/test', plot_heatmap(gate_out[:4]), global_idx)
                 writer.add_image(f'attention/test', plot_att_heads(att_heads, 1), global_idx)
                 writer.add_image(f'attention_dec/test', plot_att_heads(att_heads_dec, 1), global_idx)
 
@@ -207,9 +166,7 @@ for epoch in tqdm(range(epoch, epoch_total),
     torch.save({
         'epoch': epoch + 1,
         'global_idx': global_idx,
-        'text_embedding': text_embedding.state_dict(),
-        'encoder': encoder.state_dict(),
-        'decoder': decoder.state_dict(),
+        'model': model.state_dict(),
         'optimizer': optimizer.state_dict()},
         f'logs/{logs_idx}/model_{epoch + 1}.pt')
 

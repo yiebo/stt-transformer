@@ -128,7 +128,8 @@ def attention(query, key, value, mask, scale=1):
     att_weight = torch.matmul(query, key.transpose(2, 3))
 
     att_weight = scale * att_weight
-    att_weight = torch.masked_fill(att_weight, mask, -float('Inf'))
+    # att_weight = torch.masked_fill(att_weight, mask, float('-inf'))
+    att_weight = att_weight - 1e4 * mask
 
     att_weight = F.softmax(att_weight, -1)
     # [B, N, T_q, T_kv] * [B, N, T_kv, C] -> [B, N, T_q, C]

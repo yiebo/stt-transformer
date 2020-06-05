@@ -12,10 +12,10 @@ from tqdm import tqdm
 
 _symbol_to_id = {s: i for i, s in enumerate(symbols)}
 _id_to_symbol = {i: s for i, s in enumerate(symbols)}
-mel_min_max = np.log([1e-5, 3000.])
+mel_min_max = np.log([2.6e-5, 3000.])
 mel_mean = np.mean(mel_min_max)
 mel_range = mel_min_max[1] - np.mean(mel_min_max)
-sample_rate = 8000
+sample_rate = 16000
 
 def preprocess(file_path='../DATASETS/LJSpeech-1.1/metadata.csv', root_dir='../DATASETS/LJSpeech-1.1'):
     with open(file_path, encoding='utf8') as file:
@@ -57,7 +57,7 @@ def rescale_mel(mel, scale=10.):
     mel = (mel - scale) / scale
     mel = ((mel * mel_range) + mel_mean)
     # mel_data = mel_data.clamp(mel_min_max[0], mel_min_max[1])
-    mel = torch.exp(mel).clamp(1e-5, 3000.)
+    mel = torch.exp(mel).clamp(mel_min_max[0], mel_min_max[1])
     return mel
 
 class MelWav(nn.Module):
